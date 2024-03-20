@@ -1,0 +1,46 @@
+[package]
+name = "tgui-player"
+edition = "2021"
+version = "0.1.0"
+authors = ["RSUU <rsuuyu@gmail.com>"]
+description = ""
+homepage = "https://crates.io/crates/tiki"
+repository = "https://github.com/rsuu/tiki"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+categories = []
+keywords = []
+
+#[lib]
+#crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = "thin"
+opt-level = 2
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = false
+strip = true
+
+#[profile.release.package."*"]
+#opt-level = 2
+#codegen-units = 1
+#debug = false
+#debug-assertions = false
+#incremental = false
+#strip = true
+
+[dependencies]
+euclid = "0.22.9"
+gst = { package = "gstreamer", version = "0.22.2" }
+gst-app = { package = "gstreamer-app", version = "0.22.0" }
+gst-video = { package = "gstreamer-video", version = "0.22.1" }
+gstreamer-audio = "0.22.0"
+pipewire = "0.8.0"
+tgui = { path = "../tgui", version = "*" }
+url = "2.5.0"
+
+[features]
