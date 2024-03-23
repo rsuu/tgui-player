@@ -4,18 +4,30 @@ use gst::{glib::SendValue, message::Application, prelude::*, *};
 use gst_app::{AppSink, AppSinkCallbacks};
 use gst_video::*;
 use std::{
+    collections::HashMap,
     env,
-    sync::{Arc, OnceLock, RwLock},
-    thread::sleep_ms,
-    time::{Duration, Instant, SystemTime},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, RwLock,
+    },
+    time::{Duration, Instant},
 };
-use tgui::items;
+use tgui::{
+    items::{self, Visibility},
+    Vi,
+};
 use url::Url;
 
 pub static DATA: OnceLock<Data> = OnceLock::new();
+pub static FLAG_EXIT: AtomicBool = AtomicBool::new(false);
 
-pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
+pub fn loop_bus(
+    pipeline: Pipeline,
+    args: Args,
+    view_map: Arc<RwLock<HashMap<(i32, i32), &'static str>>>,
+) -> tgui::Res<()> {
     let mut position = 0;
+    dbg!("loop_bus");
 
     pipeline.set_state(State::Paused).unwrap();
 
@@ -23,10 +35,9 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
         .bus()
         .expect("Pipeline without bus. Shouldn't happen!");
 
-    let mut timeout = SystemTime::now();
-    let mut touch_count = 0;
-    let mut flag_double_click = false;
+    let mut click_gesture = ClickGesture::default();
     'l: for msg in bus.iter_timed(ClockTime::NONE) {
+        // gst
         match msg.view() {
             // with `sync=false`
             //MessageView::AsyncDone(..) => {
@@ -34,13 +45,17 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
 
             // with `sync=true`
             MessageView::DurationChanged(..) => {
-                let _ = pipeline.seek_simple(SeekFlags::FLUSH, position * ClockTime::SECOND);
+                while pipeline
+                    .seek_simple(SeekFlags::FLUSH, position * ClockTime::SECOND)
+                    .is_err()
+                {}
                 pipeline.set_state(State::Playing).unwrap();
 
                 position += 1;
             }
 
             MessageView::Application(v) => {
+
                 //let Ok(msg) = v.structure().unwrap().get("status") else {
                 //    continue;
                 //};
@@ -54,6 +69,10 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
                 //    }
                 //    _ => {}
                 //}
+            }
+
+            MessageView::StreamStart(..) => {
+                println!("StreamStart");
             }
 
             // The End-of-stream message is posted when the stream is done, which in our case
@@ -70,7 +89,11 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
                 // Infinite loop
                 else if args.loop_nums == 0 {
                     position = 0;
-                    let _ = pipeline.seek_simple(SeekFlags::FLUSH, ClockTime::ZERO);
+
+                    while pipeline
+                        .seek_simple(SeekFlags::FLUSH, ClockTime::ZERO)
+                        .is_err()
+                    {}
                     pipeline.set_state(State::Playing).unwrap();
                 } else {
                     // for in 0...max
@@ -87,10 +110,11 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
             _ => {}
         }
 
-        let Some(Data { app, act }) = DATA.get() else {
+        // window
+        let Some(Data { act, pg }) = DATA.get() else {
             continue 'l;
         };
-        let Some(e) = app.get_event()? else {
+        let Some(e) = act.get_event()? else {
             continue 'l;
         };
 
@@ -98,45 +122,87 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
             // TODO:
             //items::event::Event::Touch(..) => 's: {}
             items::event::Event::Click(items::ClickEvent { v, .. }) => 's: {
-                // double click
-                if flag_double_click {
-                    // if !timeout
-                    let cur = SystemTime::now();
+                let view_map = view_map.read().unwrap();
+                let items::View { aid, id } = v.unwrap();
+                let Some(name) = view_map.get(&(aid, id)) else {
+                    break 's;
+                };
 
-                    if cur < timeout + Duration::from_millis(100) {
+                if name == &"pg" {
+                    dbg!(&pipeline.current_clock_time());
+                    break 's;
+                }
+
+                if click_gesture.is_one() {
+                    dbg!("Maybe Double Click");
+
+                    let now = click_gesture.dur();
+
+                    // if too fast
+                    if now < Duration::from_millis(100) {
                         break 's;
                     }
 
-                    if cur > timeout + Duration::from_millis(250) {
-                        println!("timeout");
+                    // if timeout
+                    if now > Duration::from_millis(200) {
+                        //dbg!("timeout");
 
-                        flag_double_click = false;
-                        timeout = cur;
+                        click_gesture.reset();
 
                         break 's;
                     }
 
-                    dbg!("Double Click");
+                    //dbg!("Couble Click");
 
-                    match pipeline.current_state() {
-                        State::Playing => {
-                            let _ = pipeline.set_state(State::Paused);
+                    let seek_step = 5;
+                    match *name {
+                        "video" => match pipeline.current_state() {
+                            State::Playing => {
+                                // TODO: pgbar
+                                pg.vi_visible(Visibility::Visible)?;
+                                let _ = pipeline.set_state(State::Paused);
+                            }
+                            State::Paused => {
+                                pg.vi_visible(Visibility::Hidden)?;
+                                let _ = pipeline.set_state(State::Playing);
+                            }
+                            _ => {}
+                        },
+                        "libtn" => 's: {
+                            if position < seek_step {
+                                break 's;
+                            }
+                            position -= seek_step;
+
+                            while pipeline
+                                .seek_simple(
+                                    SeekFlags::FLUSH | SeekFlags::KEY_UNIT,
+                                    position * ClockTime::SECOND,
+                                )
+                                .is_err()
+                            {}
                         }
-                        State::Paused => {
-                            let _ = pipeline.set_state(State::Playing);
+                        "ribtn" => 's: {
+                            dbg!("seek next");
+
+                            position += seek_step;
+                            while pipeline
+                                .seek_simple(
+                                    SeekFlags::FLUSH | SeekFlags::KEY_UNIT,
+                                    position * ClockTime::SECOND,
+                                )
+                                .is_err()
+                            {}
+                            pipeline.set_state(State::Playing).unwrap();
                         }
                         _ => {}
                     }
 
-                    flag_double_click = false;
-                    timeout = cur;
-
-                // single click
+                    click_gesture.reset();
                 } else {
-                    dbg!("Single Click");
+                    //dbg!("Single Click");
 
-                    flag_double_click = true;
-                    timeout = SystemTime::now();
+                    click_gesture.timing();
 
                     break 's;
                 }
@@ -145,31 +211,31 @@ pub fn main(pipeline: Pipeline, args: Args) -> tgui::Res<()> {
             items::event::Event::Back(items::BackButtonEvent { .. }) => {
                 dbg!("Back");
 
-                let _ = pipeline.set_state(State::Null);
-                bus.remove_signal_watch();
+                // exit main()
+                FLAG_EXIT.store(true, Ordering::Relaxed);
 
-                app.close();
-                return Ok(());
+                // exit loop-bus()
+                break 'l;
             }
 
             items::event::Event::Start(items::StartEvent { .. }) => {
                 dbg!("start");
 
-                app.event_intercept_volume(act, true, true)?;
-                app.event_intercept_back(act)?;
+                act.event_intercept_volume(true, true)?;
+                act.event_intercept_back()?;
             }
 
             _ => {}
         }
     }
 
-    pipeline.set_state(State::Null).unwrap();
+    while pipeline.set_state(State::Null).is_err() {}
 
     Ok(())
 }
 
-pub fn create_pipeline(res: Arc<RwLock<WrapBuffer>>, uri: String) -> NewPipe {
-    init().unwrap();
+pub fn loop_callback(res: Arc<RwLock<WrapBuffer>>, uri: String) -> NewPipe {
+    gst::init().unwrap();
 
     let uri = {
         if let Some(name) = uri.strip_prefix("./") {
@@ -209,6 +275,18 @@ uridecodebin uri={uri} name=de
         .expect("Sink element not found")
         .downcast::<AppSink>()
         .expect("Sink element is expected to be an appsink!");
+    //let vid_pad = vid_sink.static_pad("vid").unwrap();
+    //    let vid_total_time = vid_sink
+    //        .query_duration::<gst::ClockTime>()
+    //        .unwrap()
+    //        .seconds();
+    //    dbg!(vid_total_time);
+
+    //    def probe_callback(hlssink_pad,info):
+    //    info_event = info.get_event()
+    //    info_structure = info_event.get_structure()
+    //    do_something_with_this_info
+    //    return Gst.PadProbeReturn.PASS
     let aud_sink = pipeline.by_name("aud").expect("Sink element not found");
     //    let vid_info = pipeline
     //        .by_name("vid_info")
@@ -254,8 +332,6 @@ uridecodebin uri={uri} name=de
     //let aud_caps = AudioCapsBuilder::new().format(AudioFormat::U32le).build();
     //aud_sink.set_caps(Some(&aud_caps));
 
-    let arc_start_time = Arc::new(SystemTime::now());
-    let start_time = arc_start_time.clone();
     // Add a handler to the "new-sample" signal.
     let vid_f = move |vid_sink: &AppSink| 's1: {
         //dbg!("video");
@@ -303,46 +379,58 @@ uridecodebin uri={uri} name=de
         //let format = info.format();
 
         let plane_data = frame.plane_data(0).unwrap();
+
         's2: {
             let mut res = res.write().unwrap();
 
             //dbg!(&res.msg);
-            match res.msg {
-                AppMsg::ToggleState => {
-                    if res.status == AppState::Played {
-                        res.status = AppState::Paused;
+            //match res.msg {
+            //    AppMsg::ToggleState => {
+            //        if res.status == AppState::Played {
+            //            res.status = AppState::Paused;
+            //
+            //            let mut s = Structure::new_empty("status");
+            //            s.set_value("paused", SendValue::from(""));
+            //
+            //            let msg = Application::new(s);
+            //            vid_sink.post_message(msg).unwrap();
+            //
+            //            break 's1 Ok(FlowSuccess::Ok);
+            //        } else if res.status == AppState::Paused {
+            //            res.status = AppState::Played;
+            //        }
+            //
+            //        res.msg = AppMsg::Unknown;
+            //    }
+            //    _ => {}
+            //}
 
-                        let mut s = Structure::new_empty("status");
-                        s.set_value("paused", SendValue::from(""));
-
-                        let msg = Application::new(s);
-                        vid_sink.post_message(msg).unwrap();
-
-                        break 's1 Ok(FlowSuccess::Ok);
-                    } else if res.status == AppState::Paused {
-                        res.status = AppState::Played;
-                    }
-
-                    res.msg = AppMsg::Unknown;
-                }
-                _ => {}
+            if res.is_synced {
+                break 's2;
             }
 
-            // init vec
+            // init
             if res.inner.width == 0 {
                 res.size = (width, height);
                 cold(&mut res.inner, width, height);
 
                 #[cold]
+                #[inline]
                 fn cold(res: &mut tgui::Buffer, width: u32, height: u32) {
                     *res = tgui::Buffer::zero(width, height).unwrap();
                 }
             }
 
-            if !res.is_synced {
-                res.inner.data.copy_from_slice(plane_data);
-                res.is_synced = true;
-            }
+            res.inner.data.copy_from_slice(plane_data);
+            res.is_synced = true;
+            res.cur_time = vid_sink
+                .query_position::<gst::ClockTime>()
+                .unwrap()
+                .seconds();
+            res.total_time = vid_sink
+                .query_duration::<gst::ClockTime>()
+                .unwrap()
+                .seconds();
 
             //dbg!(&res.width);
         }
@@ -404,6 +492,9 @@ pub struct WrapBuffer {
     pub is_synced: bool,
     pub msg: AppMsg,
     pub status: AppState,
+
+    pub cur_time: u64,
+    pub total_time: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +519,20 @@ enum TimestampFormat {
     Human,
 }
 
+#[derive(Default)]
+struct ClickGesture {
+    ty: ClickTy,
+    timer: Option<Instant>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ClickTy {
+    #[default]
+    Zero,
+    One,
+    Two,
+}
+
 #[derive(Debug, Default)]
 pub struct Args {
     uri: String,
@@ -436,13 +541,13 @@ pub struct Args {
 
 #[derive(Debug, Clone)]
 pub struct Data {
-    app: tgui::Tgui,
     act: tgui::Activity,
+    pg: tgui::LinearLayout,
 }
 
 impl Data {
-    pub fn new(app: tgui::Tgui, act: tgui::Activity) -> Self {
-        Self { app, act }
+    pub fn new(act: tgui::Activity, pg: tgui::LinearLayout) -> Self {
+        Self { act, pg }
     }
 }
 
@@ -480,6 +585,53 @@ impl WrapBuffer {
             is_synced: false,
             msg: AppMsg::Unknown,
             status: AppState::Played,
+            cur_time: 0,
+            total_time: 0,
         }
     }
+
+    pub fn fmt_cur_time(&self) -> String {
+        fmt_time(self.cur_time)
+    }
+
+    pub fn fmt_total_time(&self) -> String {
+        fmt_time(self.total_time)
+    }
 }
+
+fn fmt_time(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+impl ClickGesture {
+    pub fn is_zero(&self) -> bool {
+        self.ty == ClickTy::Zero
+    }
+
+    pub fn is_one(&self) -> bool {
+        self.ty == ClickTy::One
+    }
+
+    pub fn is_two(&self) -> bool {
+        self.ty == ClickTy::Two
+    }
+
+    pub fn timing(&mut self) {
+        self.ty = ClickTy::One;
+        self.timer = Some(Instant::now());
+    }
+
+    pub fn dur(&self) -> Duration {
+        self.timer.unwrap().elapsed()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default()
+    }
+}
+
+// REFS: https://developer.android.com/reference/android/media/MediaCodec.html
